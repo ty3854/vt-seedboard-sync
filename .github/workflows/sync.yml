@@ -1,0 +1,45 @@
+name: seedboard-sync
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'   # 고리가 끊겼을 때 다시 시작용
+permissions:
+  contents: write
+  actions: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: sheet sync
+        env:
+          G_CLIENT_ID: ${{ secrets.G_CLIENT_ID }}
+          G_CLIENT_SECRET: ${{ secrets.G_CLIENT_SECRET }}
+          G_REFRESH: ${{ secrets.G_REFRESH }}
+          FB_REFRESH: ${{ secrets.FB_REFRESH }}
+          FB_CLIENT_ID: ${{ secrets.FB_CLIENT_ID }}
+          FB_CLIENT_SECRET: ${{ secrets.FB_CLIENT_SECRET }}
+          SHEET_KR: ${{ secrets.SHEET_KR }}
+          SHEET_JP: ${{ secrets.SHEET_JP }}
+          SHEET_GL: ${{ secrets.SHEET_GL }}
+        run: node sync.js
+      - name: keepalive (하루 1번 커밋)
+        if: always()
+        run: |
+          date -u +%F > last-run.txt
+          git config user.name "seedboard-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add last-run.txt
+          git diff --cached --quiet || (git commit -m "daily keepalive" && git push) || true
+      - name: wait 4 min then chain next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 240
+          busy=$(gh run list -R ${{ github.repository }} -w seedboard-sync --json status,databaseId --jq '[.[] | select((.status=="queued" or .status=="in_progress" or .status=="pending") and .databaseId != ${{ github.run_id }})] | length')
+          if [ "$busy" = "0" ]; then gh workflow run seedboard-sync -R ${{ github.repository }}; else echo "another run active: $busy"; fi
