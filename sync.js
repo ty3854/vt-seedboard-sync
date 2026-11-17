@@ -6,7 +6,9 @@
 const env = (k) => { const v = process.env[k]; if (!v) throw new Error('missing ' + k); return v; };
 const SHEETS = { kr: env('SHEET_KR'), kf: env('SHEET_KF'), jp: env('SHEET_JP'), global: env('SHEET_GL') };
 const FREE = env('SHEET_FREE'); // 국내_자유시트 (문안&가이드 탭 = 국내 캠페인 목록)
-const SRC = { kr: ['kr', 'kf'] }; // 국내 캠페인 수량 = 국내 시트 + 재한외국인 시트
+const SRC = { kr: ['kr', 'kf'] };
+// 국내 리스트업(261117 훈이님): 국내 시트 크리에이터 탭만 · O열 섭외 키워드 대괄호 기준 · 아래 담당자만
+const KR_OWN = new Set(['김예린', '장서현', '김재원', '이시현', '이훈', '김수연', '김주희', '양정인']); // 국내 캠페인 수량 = 국내 시트 + 재한외국인 시트
 const FB_ID = env('FB_CLIENT_ID'), FB_SECRET = env('FB_CLIENT_SECRET');
 const FS = 'https://firestore.googleapis.com/v1/projects/vt-guides-fa7e7/databases/seedboard/documents';
 const HOST = 'https://firebasehosting.googleapis.com/v1beta1', SITE = 'sites/vt-seeding-board';
@@ -76,13 +78,13 @@ async function syncFree(gt, H, now) {
   // 시트 읽기 (필요한 열만)
   const D = {};
   for (const [r, id] of Object.entries(SHEETS)) {
-    const rg = ['크리에이터!D1:D', '크리에이터!P1:P', '발송!G1:G', '발송!S1:S', '발송!AC1:AC', '크리에이터!A1:A'];
+    const rg = ['크리에이터!D1:D', '크리에이터!P1:P', '발송!G1:G', '발송!S1:S', '발송!AC1:AC', '크리에이터!A1:A', '크리에이터!C1:C', '크리에이터!O1:O'];
     const j = await (await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}/values:batchGet?${rg.map((x) => 'ranges=' + encodeURIComponent(x)).join('&')}`, { headers: { Authorization: 'Bearer ' + gt } })).json();
     if (!j.valueRanges) throw new Error(r + ' sheet fail ' + ((j.error && j.error.status) || 'unknown'));
-    const [cp, cq, sg, ss, sac, ca] = j.valueRanges.map((x) => (x.values || []).map((v) => (v && v[0]) || ''));
+    const [cp, cq, sg, ss, sac, ca, cc, co] = j.valueRanges.map((x) => (x.values || []).map((v) => (v && v[0]) || ''));
     if (cp[0] !== '진행' || cq[0] !== '섭외 제품' || sg[0] !== '섭외 제품' || ss[0] !== '진행' || sac[0] !== '7일차 조회수') throw new Error(r + ' 머리글 위치가 바뀜: ' + [cp[0], cq[0], sg[0], ss[0], sac[0]].join('/'));
     const nC = Math.max(cp.length, cq.length) - 1, nS = Math.max(sg.length, ss.length, sac.length) - 1;
-    const cre = Array.from({ length: nC }, (_, i) => ({ st: clean(cp[i + 1]), k: key(cq[i + 1]), id: String(ca[i + 1] || '').trim() }));
+    const cre = Array.from({ length: nC }, (_, i) => ({ st: clean(cp[i + 1]), k: key(cq[i + 1]), id: String(ca[i + 1] || '').trim(), own: String(cc[i + 1] || '').trim(), ko: key(co[i + 1]) }));
     const shp = Array.from({ length: nS }, (_, i) => ({ k: key(sg[i + 1]), st: clean(ss[i + 1]), v7: parseInt(String(sac[i + 1] || '').replace(/[^\d]/g, ''), 10) }));
     let del = [];
     if (r === 'kr' || r === 'kf') {
@@ -97,7 +99,7 @@ async function syncFree(gt, H, now) {
       }
     }
     // 크리에이터 탭 A열(키)도 같이 읽어 중복 제거용으로 씀
-    D[r] = { cre: cre.filter((x) => x.k || x.st), shp, del };
+    D[r] = { cre: cre.filter((x) => x.k || x.st), all: cre, shp, del };
   }
   // 캠페인 읽기
   let docs = [], pt = '';
@@ -110,7 +112,7 @@ async function syncFree(gt, H, now) {
     const cnt = {}; [...D[r].shp, ...D[r].cre].forEach((x) => { if (x.k) cnt[x.k] = (cnt[x.k] || 0) + 1; });
     regions[r] = { all: { n: v.length, avg: v.length ? Math.round(v.reduce((a, b) => a + b, 0) / v.length) : 0 }, br: Object.entries(cnt).sort((a, b) => b[1] - a[1]).map((x) => x[0]) };
     const liveIds = new Set(D[r].cre.map((x) => x.id).filter(Boolean)); const delIds = new Set(D[r].del.filter((x) => !liveIds.has(x.id)).map((x) => x.id));
-    tot[r] = { L: D[r].cre.filter((x) => x.st || x.k).length + delIds.size, C: D[r].shp.filter((x) => x.k || x.st).length, U: D[r].shp.filter((x) => x.st === '포스팅완료').length };
+    tot[r] = { L: r === 'kr' ? D.kr.all.filter((x) => KR_OWN.has(x.own)).length : D[r].cre.filter((x) => x.st || x.k).length + delIds.size, C: D[r].shp.filter((x) => x.k || x.st).length, U: D[r].shp.filter((x) => x.st === '포스팅완료').length };
   }
   // 캠페인별 계산·쓰기(바뀐 것만)
   const statsC = {}; let changed = 0;
@@ -123,7 +125,7 @@ async function syncFree(gt, H, now) {
       d.del.forEach((x) => { if (x.k === k && x.st !== '발송완료') lset.add(x.id); });
       sh = sh.concat(d.shp.filter((x) => x.k === k));
     }
-    const L = lset.size + lnoid;
+    const L = r === 'kr' ? D.kr.all.filter((x) => x.ko === k && KR_OWN.has(x.own)).length : lset.size + lnoid;
     const C = sh.length, U = sh.filter((x) => x.st === '포스팅완료').length;
     const v = sh.map((x) => x.v7).filter((x) => Number.isFinite(x));
     if (v.length) { const avg = Math.round(v.reduce((a, x) => a + x, 0) / v.length); statsC[c.id] = { key: k, n: v.length, avg, eff: regions[r].all.avg ? Math.round(avg / regions[r].all.avg * 100) : null }; }
