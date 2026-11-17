@@ -24,15 +24,26 @@ const val = (v) => v == null ? null : v.stringValue ?? (v.integerValue != null ?
   // 시트 읽기 (필요한 열만)
   const D = {};
   for (const [r, id] of Object.entries(SHEETS)) {
-    const rg = ['크리에이터!D1:D', '크리에이터!P1:P', '발송!G1:G', '발송!S1:S', '발송!AC1:AC'];
+    const rg = ['크리에이터!D1:D', '크리에이터!P1:P', '발송!G1:G', '발송!S1:S', '발송!AC1:AC', '크리에이터!A1:A'];
     const j = await (await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}/values:batchGet?${rg.map((x) => 'ranges=' + encodeURIComponent(x)).join('&')}`, { headers: { Authorization: 'Bearer ' + gt } })).json();
     if (!j.valueRanges) throw new Error(r + ' sheet fail ' + ((j.error && j.error.status) || 'unknown'));
-    const [cp, cq, sg, ss, sac] = j.valueRanges.map((x) => (x.values || []).map((v) => (v && v[0]) || ''));
+    const [cp, cq, sg, ss, sac, ca] = j.valueRanges.map((x) => (x.values || []).map((v) => (v && v[0]) || ''));
     if (cp[0] !== '진행' || cq[0] !== '섭외 제품' || sg[0] !== '섭외 제품' || ss[0] !== '진행' || sac[0] !== '7일차 조회수') throw new Error(r + ' 머리글 위치가 바뀜: ' + [cp[0], cq[0], sg[0], ss[0], sac[0]].join('/'));
     const nC = Math.max(cp.length, cq.length) - 1, nS = Math.max(sg.length, ss.length, sac.length) - 1;
-    const cre = Array.from({ length: nC }, (_, i) => ({ st: clean(cp[i + 1]), k: key(cq[i + 1]) }));
+    const cre = Array.from({ length: nC }, (_, i) => ({ st: clean(cp[i + 1]), k: key(cq[i + 1]), id: String(ca[i + 1] || '').trim() }));
     const shp = Array.from({ length: nS }, (_, i) => ({ k: key(sg[i + 1]), st: clean(ss[i + 1]), v7: parseInt(String(sac[i + 1] || '').replace(/[^\d]/g, ''), 10) }));
-    D[r] = { cre: cre.filter((x) => x.k || x.st), shp };
+    let del = [];
+    if (r === 'kr') {
+      const rg2 = ['리스트업 백업!I1:I', '리스트업 백업!M1:M', '리스트업 백업!S1:S'];
+      const j2 = await (await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}/values:batchGet?${rg2.map((x) => 'ranges=' + encodeURIComponent(x)).join('&')}`, { headers: { Authorization: 'Bearer ' + gt } })).json();
+      if (!j2.valueRanges) throw new Error('kr listup-backup fail');
+      const [bi, bm, bs] = j2.valueRanges.map((x) => (x.values || []).map((v) => (v && v[0]) || ''));
+      if (bi[0] !== '진행' || bm[0] !== '섭외 제품' || bs[0] !== '키') throw new Error('리스트업 백업 머리글 위치가 바뀜');
+      const n = Math.max(bi.length, bm.length, bs.length) - 1;
+      del = Array.from({ length: n }, (_, i) => ({ st: clean(bi[i + 1]), k: key(bm[i + 1]), id: String(bs[i + 1] || '').trim() })).filter((x) => x.id);
+    }
+    // 크리에이터 탭 A열(키)도 같이 읽어 중복 제거용으로 씀
+    D[r] = { cre: cre.filter((x) => x.k || x.st), shp, del };
   }
   // 캠페인 읽기
   let docs = [], pt = '';
@@ -44,14 +55,18 @@ const val = (v) => v == null ? null : v.stringValue ?? (v.integerValue != null ?
     const v = D[r].shp.map((x) => x.v7).filter((x) => Number.isFinite(x));
     const cnt = {}; [...D[r].shp, ...D[r].cre].forEach((x) => { if (x.k) cnt[x.k] = (cnt[x.k] || 0) + 1; });
     regions[r] = { all: { n: v.length, avg: v.length ? Math.round(v.reduce((a, b) => a + b, 0) / v.length) : 0 }, br: Object.entries(cnt).sort((a, b) => b[1] - a[1]).map((x) => x[0]) };
-    tot[r] = { L: D[r].cre.filter((x) => x.st || x.k).length, C: D[r].shp.filter((x) => x.k || x.st).length, U: D[r].shp.filter((x) => x.st === '포스팅완료').length };
+    const liveIds = new Set(D[r].cre.map((x) => x.id).filter(Boolean)); const delIds = new Set(D[r].del.filter((x) => !liveIds.has(x.id)).map((x) => x.id));
+    tot[r] = { L: D[r].cre.filter((x) => x.st || x.k).length + delIds.size, C: D[r].shp.filter((x) => x.k || x.st).length, U: D[r].shp.filter((x) => x.st === '포스팅완료').length };
   }
   // 캠페인별 계산·쓰기(바뀐 것만)
   const statsC = {}; let changed = 0;
   for (const c of camps) {
     const b = (c.links || []).find((l) => l && l.g === 'b'); if (!b || !b.url) continue;
     const k = String(b.url).replace(/\s+/g, ''), r = SHEETS[c.region] ? c.region : 'kr', d = D[r];
-    const L = d.cre.filter((x) => x.k === k && x.st !== '발송완료').length;
+    const lset = new Set(); let lnoid = 0;
+    d.cre.forEach((x) => { if (x.k === k && x.st !== '발송완료') { if (x.id) lset.add(x.id); else lnoid++; } });
+    d.del.forEach((x) => { if (x.k === k && x.st !== '발송완료') lset.add(x.id); });
+    const L = lset.size + lnoid;
     const sh = d.shp.filter((x) => x.k === k);
     const C = sh.length, U = sh.filter((x) => x.st === '포스팅완료').length;
     const v = sh.map((x) => x.v7).filter((x) => Number.isFinite(x));
