@@ -4,7 +4,9 @@
 // 2) 권역별 전체 수량 → campaigns/_sync.tot
 // 3) 7일차 조회 평균·효율·대괄호 목록 → 호스팅 stats.json (화면 '시트 연동 N분 전' 기준)
 const env = (k) => { const v = process.env[k]; if (!v) throw new Error('missing ' + k); return v; };
-const SHEETS = { kr: env('SHEET_KR'), jp: env('SHEET_JP'), global: env('SHEET_GL') };
+const SHEETS = { kr: env('SHEET_KR'), kf: env('SHEET_KF'), jp: env('SHEET_JP'), global: env('SHEET_GL') };
+const FREE = env('SHEET_FREE'); // 국내_자유시트 (문안&가이드 탭 = 국내 캠페인 목록)
+const SRC = { kr: ['kr', 'kf'] }; // 국내 캠페인 수량 = 국내 시트 + 재한외국인 시트
 const FB_ID = env('FB_CLIENT_ID'), FB_SECRET = env('FB_CLIENT_SECRET');
 const FS = 'https://firestore.googleapis.com/v1/projects/vt-guides-fa7e7/databases/seedboard/documents';
 const HOST = 'https://firebasehosting.googleapis.com/v1beta1', SITE = 'sites/vt-seeding-board';
@@ -16,11 +18,61 @@ async function token(id, secret, refresh) {
 const key = (t) => { const m = String(t || '').trim().match(/^(\s*\[[^\]]*\])+/); return m ? m[0].replace(/\s+/g, '') : ''; };
 const clean = (s) => String(s || '').replace(/\s/g, '');
 const val = (v) => v == null ? null : v.stringValue ?? (v.integerValue != null ? +v.integerValue : null) ?? v.booleanValue ?? v.timestampValue ?? (v.mapValue ? Object.fromEntries(Object.entries(v.mapValue.fields || {}).map(([k, x]) => [k, val(x)])) : null) ?? (v.arrayValue ? (v.arrayValue.values || []).map(val) : null);
+
+// 국내_자유시트 '문안&가이드' → 국내 캠페인 목록 (상태 A·담당자 C·구성 D·가이드 링크 H)
+//  · 처음 본 캠페인은 기준값(shv)만 저장 → 이후 시트 값이 바뀐 칸만 사이트에 반영(사이트에서 고친 값은 시트가 바뀌기 전까지 유지)
+//  · 상태 '종료' = 완료(맨 아래로) · 메인/스팟성 행 중 사이트에 없는 구성은 새 캠페인으로 추가
+const nk = (x) => String(x || '').replace(/\s+/g, ' ').trim();
+const nu = (u) => u.replace(/[#?].*$/, '').replace(/\/$/, '');
+const urlsOf = (x) => [...new Set(String(x || '').match(/https?:\/\/[^\s,]+/g) || [])];
+const enc = (v) => v === null || v === undefined ? { nullValue: null } : typeof v === 'string' ? { stringValue: v } : typeof v === 'boolean' ? { booleanValue: v } : typeof v === 'number' ? { integerValue: String(v) } : Array.isArray(v) ? { arrayValue: { values: v.map(enc) } } : v instanceof Date ? { timestampValue: v.toISOString() } : { mapValue: { fields: Object.fromEntries(Object.entries(v).map(([a, b]) => [a, enc(b)])) } };
+async function syncFree(gt, H, now) {
+  const j = await (await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${FREE}/values/${encodeURIComponent("'문안&가이드'!A1:I")}`, { headers: { Authorization: 'Bearer ' + gt } })).json();
+  const rows = j.values; if (!rows) throw new Error('free sheet fail ' + ((j.error && j.error.status) || ''));
+  const h = rows[0]; if (h[0] !== '상태' || h[2] !== '담당자' || h[3] !== '구성' || h[7] !== '가이드 링크') throw new Error('자유시트 머리글 위치가 바뀜 ' + h.join('/'));
+  const SR = rows.slice(1).map((r) => ({ st: nk(r[0]), own: nk(r[2]), comp: nk(r[3]), urls: urlsOf(r[7]), concept: nk(r[8]) })).filter((x) => ['메인', '스팟성', '종료'].includes(x.st) && (x.comp || x.urls.length));
+  const cj = await (await fetch(`${FS}/campaigns?pageSize=300`, { headers: H })).json();
+  const kr = (cj.documents || []).map((d) => ({ id: d.name.split('/').pop(), ...Object.fromEntries(Object.entries(d.fields || {}).map(([a, b]) => [a, val(b)])) })).filter((c) => c.id !== '_sync' && (c.region || 'kr') === 'kr');
+  const link = (c, g) => (c.links || []).filter((l) => l && l.g === g).map((l) => String(l.url || ''));
+  const used = new Set(); let created = 0, updated = 0, base = 0;
+  const shvOf = (x) => JSON.stringify({ st: x.st, own: x.own, comp: x.comp, urls: x.urls });
+  for (const x of SR) {
+    let c = x.comp && kr.find((c) => !used.has(c.id) && link(c, 's').some((s) => nk(s) === x.comp));
+    if (!c && x.urls.length) c = kr.find((c) => !used.has(c.id) && link(c, 'g').some((u) => x.urls.some((v) => nu(v) === nu(u))));
+    if (!c && x.comp) { const k = key(x.comp); const m = k ? kr.filter((c) => !used.has(c.id) && link(c, 'b').some((b) => b.replace(/\s+/g, '') === k)) : []; if (m.length === 1 && SR.filter((y) => key(y.comp) === k).length === 1) c = m[0]; }
+    if (c) {
+      used.add(c.id); const sv = shvOf(x); if (c.shv === sv) continue;
+      const upd = { shv: sv }; let prev = null; try { prev = c.shv ? JSON.parse(c.shv) : null; } catch (e) {}
+      if (!prev) { if (x.st === '종료' && c.stat !== 'done') upd.stat = 'done'; base++; }
+      else {
+        if (prev.st !== x.st) { if (x.st === '종료') upd.stat = 'done'; else { upd.team = x.st === '메인' ? 'main' : 'spot'; if (c.stat === 'done') upd.stat = 'prog'; } }
+        if (prev.own !== x.own) upd.owner = x.own;
+        if (prev.comp !== x.comp && x.comp) { upd.prod = x.comp.replace(/^(\s*\[[^\]]*\])+\s*/, '') || c.prod || ''; upd.links = (c.links || []).filter((l) => l.g !== 's').concat([{ g: 's', url: x.comp }]); }
+        if (prev.urls.join() !== x.urls.join()) upd.links = (upd.links || c.links || []).filter((l) => l.g !== 'g').concat(x.urls.map((u) => ({ g: 'g', url: u })));
+        upd.updatedAt = new Date(now); upd.updatedBy = 'sync:kr-자유시트'; updated++;
+      }
+      const qs = Object.keys(upd).map((k) => 'updateMask.fieldPaths=' + k).join('&');
+      const res = await fetch(`${FS}/campaigns/${c.id}?${qs}&currentDocument.exists=true`, { method: 'PATCH', headers: H, body: JSON.stringify({ fields: Object.fromEntries(Object.entries(upd).map(([a, b]) => [a, enc(b)])) }) });
+      if (!res.ok) throw new Error('free update fail ' + c.id + ' ' + res.status);
+      continue;
+    }
+    if (x.st === '종료' || !key(x.comp)) continue; // 끝난 행·대괄호 없는 행은 새로 만들지 않음
+    const id = 'krf' + crypto.createHash('sha1').update(x.comp).digest('hex').slice(0, 10);
+    const name = (x.comp.match(/^(\s*\[[^\]]*\])+/)[0].match(/\[([^\]]*)\]/g) || []).map((t) => t.slice(1, -1).trim()).filter((t) => t && t !== '스팟').join(' · ');
+    const doc = { name: name || key(x.comp), prod: x.comp.replace(/^(\s*\[[^\]]*\])+\s*/, ''), region: 'kr', team: x.st === '메인' ? 'main' : 'spot', owner: x.own, stat: 'prog', sch: '미정', ch: '', apply: '', concept: /https?:/.test(x.concept) ? '' : x.concept.slice(0, 120), reqBy: '', sample: false, codes: [],
+      links: [{ g: 'b', url: key(x.comp) }, { g: 's', url: x.comp }].concat(x.urls.map((u) => ({ g: 'g', url: u }))), f: { G: 0, L: 0, O: 0, R: 0, C: 0, S: 0, U: 0 }, order: Date.parse(now) + created, createdAt: new Date(now), updatedAt: new Date(now), createdBy: 'sync:kr-자유시트', updatedBy: 'sync:kr-자유시트', shv: shvOf(x) };
+    const res = await fetch(`${FS}/campaigns?documentId=${id}`, { method: 'POST', headers: H, body: JSON.stringify({ fields: Object.fromEntries(Object.entries(doc).map(([a, b]) => [a, enc(b)])) }) });
+    if (res.status === 409) continue; if (!res.ok) throw new Error('free create fail ' + res.status + ' ' + (await res.text()).slice(0, 200));
+    created++;
+  }
+  return { rows: SR.length, created, updated, base };
+}
 (async () => {
   const t0 = Date.now(), now = new Date().toISOString();
   const gt = await token(env('G_CLIENT_ID'), env('G_CLIENT_SECRET'), env('G_REFRESH'));
   const ft = await token(FB_ID, FB_SECRET, env('FB_REFRESH'));
   const H = { Authorization: 'Bearer ' + ft, 'Content-Type': 'application/json' };
+  const freeRes = await syncFree(gt, H, now);
   // 시트 읽기 (필요한 열만)
   const D = {};
   for (const [r, id] of Object.entries(SHEETS)) {
@@ -33,14 +85,16 @@ const val = (v) => v == null ? null : v.stringValue ?? (v.integerValue != null ?
     const cre = Array.from({ length: nC }, (_, i) => ({ st: clean(cp[i + 1]), k: key(cq[i + 1]), id: String(ca[i + 1] || '').trim() }));
     const shp = Array.from({ length: nS }, (_, i) => ({ k: key(sg[i + 1]), st: clean(ss[i + 1]), v7: parseInt(String(sac[i + 1] || '').replace(/[^\d]/g, ''), 10) }));
     let del = [];
-    if (r === 'kr') {
+    if (r === 'kr' || r === 'kf') {
       const rg2 = ['리스트업 백업!I1:I', '리스트업 백업!M1:M', '리스트업 백업!S1:S'];
       const j2 = await (await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}/values:batchGet?${rg2.map((x) => 'ranges=' + encodeURIComponent(x)).join('&')}`, { headers: { Authorization: 'Bearer ' + gt } })).json();
-      if (!j2.valueRanges) throw new Error('kr listup-backup fail');
+      if (!j2.valueRanges && r === 'kr') throw new Error(r + ' listup-backup fail');
+      if (j2.valueRanges) {
       const [bi, bm, bs] = j2.valueRanges.map((x) => (x.values || []).map((v) => (v && v[0]) || ''));
-      if (bi[0] !== '진행' || bm[0] !== '섭외 제품' || bs[0] !== '키') throw new Error('리스트업 백업 머리글 위치가 바뀜');
+      if ((bi[0] || bm[0] || bs[0]) && (bi[0] !== '진행' || bm[0] !== '섭외 제품' || bs[0] !== '키')) throw new Error(r + ' 리스트업 백업 머리글 위치가 바뀜');
       const n = Math.max(bi.length, bm.length, bs.length) - 1;
       del = Array.from({ length: n }, (_, i) => ({ st: clean(bi[i + 1]), k: key(bm[i + 1]), id: String(bs[i + 1] || '').trim() })).filter((x) => x.id);
+      }
     }
     // 크리에이터 탭 A열(키)도 같이 읽어 중복 제거용으로 씀
     D[r] = { cre: cre.filter((x) => x.k || x.st), shp, del };
@@ -62,12 +116,14 @@ const val = (v) => v == null ? null : v.stringValue ?? (v.integerValue != null ?
   const statsC = {}; let changed = 0;
   for (const c of camps) {
     const b = (c.links || []).find((l) => l && l.g === 'b'); if (!b || !b.url) continue;
-    const k = String(b.url).replace(/\s+/g, ''), r = SHEETS[c.region] ? c.region : 'kr', d = D[r];
-    const lset = new Set(); let lnoid = 0;
-    d.cre.forEach((x) => { if (x.k === k && x.st !== '발송완료') { if (x.id) lset.add(x.id); else lnoid++; } });
-    d.del.forEach((x) => { if (x.k === k && x.st !== '발송완료') lset.add(x.id); });
+    const k = String(b.url).replace(/\s+/g, ''), r = ['kr', 'jp', 'global'].includes(c.region) ? c.region : 'kr', ds = (SRC[r] || [r]).map((x) => D[x]);
+    const lset = new Set(); let lnoid = 0, sh = [];
+    for (const d of ds) {
+      d.cre.forEach((x) => { if (x.k === k && x.st !== '발송완료') { if (x.id) lset.add(x.id); else lnoid++; } });
+      d.del.forEach((x) => { if (x.k === k && x.st !== '발송완료') lset.add(x.id); });
+      sh = sh.concat(d.shp.filter((x) => x.k === k));
+    }
     const L = lset.size + lnoid;
-    const sh = d.shp.filter((x) => x.k === k);
     const C = sh.length, U = sh.filter((x) => x.st === '포스팅완료').length;
     const v = sh.map((x) => x.v7).filter((x) => Number.isFinite(x));
     if (v.length) { const avg = Math.round(v.reduce((a, x) => a + x, 0) / v.length); statsC[c.id] = { key: k, n: v.length, avg, eff: regions[r].all.avg ? Math.round(avg / regions[r].all.avg * 100) : null }; }
@@ -98,5 +154,5 @@ const val = (v) => v == null ? null : v.stringValue ?? (v.integerValue != null ?
   if ((pop.uploadRequiredHashes || []).includes(h)) { const u = await fetch(`${pop.uploadUrl}/${h}`, { method: 'POST', headers: { Authorization: 'Bearer ' + ft, 'Content-Type': 'application/octet-stream' }, body: gz }); if (!u.ok) throw new Error('upload fail ' + u.status); }
   await api('PATCH', `${ver}?update_mask=status`, { status: 'FINALIZED' });
   await api('POST', `${SITE}/releases?versionName=${encodeURIComponent(ver)}`, { message: 'auto sheet sync' });
-  console.log(JSON.stringify({ campaigns: camps.length, changed, statsC: Object.keys(statsC).length, tot, sec: Math.round((Date.now() - t0) / 1000) }));
+  console.log(JSON.stringify({ free: freeRes, campaigns: camps.length, changed, statsC: Object.keys(statsC).length, tot, sec: Math.round((Date.now() - t0) / 1000) }));
 })().catch((e) => { console.error('FAIL', e.message); process.exit(1); });

@@ -2,8 +2,7 @@ name: seedboard-sync
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *'   # 고리가 끊겼을 때 다시 시작용
-permissions:
+    - cron: '*/30 * * * *'   # 怨좊━媛 ?딄꼈?????ㅼ떆 ?쒖옉??permissions:
   contents: write
   actions: write
 jobs:
@@ -26,8 +25,10 @@ jobs:
           SHEET_KR: ${{ secrets.SHEET_KR }}
           SHEET_JP: ${{ secrets.SHEET_JP }}
           SHEET_GL: ${{ secrets.SHEET_GL }}
+          SHEET_KF: ${{ secrets.SHEET_KF }}
+          SHEET_FREE: ${{ secrets.SHEET_FREE }}
         run: node sync.js
-      - name: keepalive (하루 1번 커밋)
+      - name: keepalive (?섎（ 1踰?而ㅻ컠)
         if: always()
         run: |
           date -u +%F > last-run.txt
